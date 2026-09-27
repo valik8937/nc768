@@ -9,7 +9,7 @@ from model import NCTrueLM
 def args_():
     p = argparse.ArgumentParser()
     p.add_argument('--steps', type=int, default=20000)
-    p.add_argument('--seq', type=int, default=512)
+    p.add_argument('--seq', type=int, default=256)
     p.add_argument('--batch', type=int, default=8)
     p.add_argument('--accum', type=int, default=8)
     p.add_argument('--lr', type=float, default=5e-4)
@@ -27,7 +27,7 @@ def main():
     m = NCTrueLM().to(dev)
     print(m.count())
     opt = torch.optim.AdamW(m.parameters(), lr=a.lr, betas=(0.9, 0.95), weight_decay=0.05)
-    sc = torch.cuda.amp.GradScaler(enabled=(dev == 'cuda'))
+    sc = torch.amp.GradScaler('cuda', enabled=(dev == 'cuda'))
     from datasets import load_dataset
     ds = load_dataset('HuggingFaceFW/fineweb-edu', name='sample-10BT', split='train', streaming=True)
     ds = ds.shuffle(seed=0, buffer_size=5000)
@@ -47,7 +47,7 @@ def main():
     while step < a.steps:
         for _ in range(a.accum):
             xb, yb = batch()
-            with torch.cuda.amp.autocast(enabled=(dev == 'cuda'), dtype=torch.float16):
+            with torch.amp.autocast('cuda', enabled=(dev == 'cuda'), dtype=torch.float16):
                 loss = F.cross_entropy(m(xb).view(-1, 256), yb.reshape(-1)) / a.accum
             sc.scale(loss).backward(); run += loss.item() * a.accum
         lr = a.lr * min(1.0, (step + 1) / a.warmup) * (0.5 + 0.5 * math.cos(math.pi * step / a.steps))

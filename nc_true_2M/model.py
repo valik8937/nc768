@@ -1,20 +1,24 @@
-"""Honest non-commutative decoder: Givens U(16), NO QKV, shared Hermitian attention + Mt.
-Budget: d=256, 4 blocks, byte vocab 256 -> ~2.4M total. No PE tables.
+"""Honest non-commutative decoder v2: real SO(16) Givens, NO complex, NO QKV, NO per-token loop.
 
-Order ONLY from product Q_t = U_t Q_{t-1} where U_t = Prod_k Givens(p_k,q_k,theta,phi).
-Commutator [X,Y] != 0 preserved (BCH term kept, unlike cumsum).
-Attention: S_ij = ReTr[A_sym Q_j^H Q_i]/n + ImTr[A_anti Q_j^H Q_i]/n, causal.
-Values = unitary features themselves (no V matrix). Memory Mt associative.
+- Order ONLY from product Q_t = U_t ... U_1, U_t = 16 real plane rotations.
+  Commutator [X,Y] != 0 preserved. No cumsum, no 1j, no ComplexHalf.
+- Rotations built vectorized over (B,T): 2 stages of 8 disjoint pairs via scatter.
+- Prefix states via parallel associative scan (log2(T) batched bmm rounds).
+- Unitary core forced fp32 (autocast disabled inside) on any device.
+- Attention: S = Tr[S_mat Qj^T Qi]/n (sym) + Tr[A_mat Qj^T Qi]/n (antisym), causal.
+  Values = unitary features themselves. Plus associative Mt memory (light real loop).
+- Budget: d=256, 4 blocks, byte vocab 256 -> ~2.46M total. No PE tables.
 """
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from contextlib import nullcontext
 
 N = 16
 PAIRS0 = [(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11), (12, 13), (14, 15)]
 PAIRS1 = [(1, 2), (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (13, 14), (15, 0)]
-PAIRS = PAIRS0 + PAIRS1  # K=16 per token
+PAIRS = PAIRS0 + PAIRS1  # K=16 plane rotations per token
 
 
 class RMSNorm(nn.Module):
@@ -26,28 +30,47 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.w
 
 
-def hermitian_param(n):
-    """Real-parameterized Hermitian matrix:  n*n real DOF, A = A^H by construction."""
-    Br = nn.Parameter(torch.randn(n, n) * 0.05)
-    Bi = nn.Parameter(torch.randn(n, n) * 0.05)
-    return Br, Bi
+def _stage(Q, P, QQ, th):
+    """One vectorized stage of 8 disjoint SO(2) rotations, over all (B,T) at once.
+    Real cos/sin only. Functional (grad-safe). Same math as the per-pair loop."""
+    c = torch.cos(th)          # (...,8)
+    s = torch.sin(th)
+    Rp = Q[..., P, :]          # (...,8,N) advanced index -> copy, no inplace
+    Rq = Q[..., QQ, :]
+    Np = c[..., None] * Rp - s[..., None] * Rq
+    Nq = s[..., None] * Rp + c[..., None] * Rq
+    B, T, _, Nn = Q.shape
+    Q = Q.scatter(2, P.view(1, 1, -1, 1).expand(B, T, P.numel(), Nn), Np)
+    Q = Q.scatter(2, QQ.view(1, 1, -1, 1).expand(B, T, QQ.numel(), Nn), Nq)
+    return Q
 
-def hermitian_build(Br, Bi):
-    B = torch.complex(Br, Bi)
-    return 0.5 * (B + B.conj().T)
+
+def _prefix_products(U):
+    """All prefix products P_t = U_t ... U_1 via parallel doubling scan.
+    log2(T) rounds, one batched bmm per round. Exact, no sequential loop."""
+    B, T, N, _ = U.shape
+    P = U
+    I = torch.eye(N, dtype=U.dtype, device=U.device).expand(B, 1, N, N)
+    stride = 1
+    while stride < T:
+        take = min(stride, T)
+        head = I.expand(B, take, N, N)
+        Ps = torch.cat([head, P[:, :T - take]], dim=1) if take < T else head
+        P = torch.matmul(P.reshape(B * T, N, N), Ps.reshape(B * T, N, N)).view(B, T, N, N)
+        stride *= 2
+    return P
 
 
 class NCBlock(nn.Module):
-    """One honest block. NO qkv Linear. Biggest mat: W_P 512->256 + SwiGLU."""
+    """Honest block. Biggest mats: W_P 512->256 + SwiGLU. No QKV anywhere."""
     def __init__(self, d=256, dk=32, dv=64):
         super().__init__()
         self.d, self.dk, self.dv = d, dk, dv
         self.n1 = RMSNorm(d)
-        self.W_theta = nn.Linear(d, 16, bias=False)  # 16 Givens angles
-        self.W_phi = nn.Linear(d, 16, bias=False)    # 16 phases
-        Br1, Bi1 = hermitian_param(N); self.As_r, self.As_i = Br1, Bi1
-        Br2, Bi2 = hermitian_param(N); self.Aa_r, self.Aa_i = Br2, Bi2
-        self.W_P = nn.Linear(2 * N * N, d, bias=False)  # vec(Q)->features
+        self.W_theta = nn.Linear(d, 16, bias=False)  # 16 plane angles, no phi
+        self.Sm = nn.Parameter(torch.randn(N, N) * 0.05)  # symmetrized at use
+        self.Am = nn.Parameter(torch.randn(N, N) * 0.05)  # antisymmetrized at use
+        self.W_P = nn.Linear(N * N, d, bias=False)  # vec(Q)->features (real)
         self.W_k = nn.Linear(d, dk, bias=False)
         self.W_v = nn.Linear(d, dv, bias=False)
         self.W_q = nn.Linear(d, dk, bias=False)
@@ -58,71 +81,49 @@ class NCBlock(nn.Module):
         self.gate = nn.Linear(d, 512, bias=False)
         self.up = nn.Linear(d, 512, bias=False)
         self.down = nn.Linear(512, d, bias=False)
-
-    def _givens_step(self, Q, th, ph, pairs):
-        # Q: (B,N,N) complex; th,ph: (B,) per pair index k
-        for (p, q) in pairs:
-            pass
-        return Q
+        self.register_buffer('P0', torch.tensor([p for p, _ in PAIRS0]), persistent=False)
+        self.register_buffer('Q0', torch.tensor([q for _, q in PAIRS0]), persistent=False)
+        self.register_buffer('P1', torch.tensor([p for p, _ in PAIRS1]), persistent=False)
+        self.register_buffer('Q1', torch.tensor([q for _, q in PAIRS1]), persistent=False)
 
     def forward(self, x):
         B, T, D = x.shape
         h = self.n1(x)
-        th = torch.tanh(self.W_theta(h)) * 0.5          # (B,T,16) bounded
-        ph = self.W_phi(h)                              # (B,T,16) unbounded phase
-        lam = torch.sigmoid(self.w_l(h)).squeeze(-1) * 0.099 + 0.9  # [0.9,0.999]
-        dev, dt = x.device, x.dtype
-        cdt = torch.complex64
-        Q = torch.eye(N, dtype=cdt, device=dev).expand(B, N, N).contiguous()
-        Qseq, Fs, Ks, Vs, Qs, Gs = [], [], [], [], [], []
-        M = torch.zeros(B, self.dk, self.dv, device=dev, dtype=dt)
-        reads = []
-        for t in range(T):
-            tht, pht = th[:, t, :], ph[:, t, :]  # (B,16)
-            for k, (p, q) in enumerate(PAIRS):
-                c = torch.cos(tht[:, k])                    # (B,)
-                s = torch.sin(tht[:, k])                    # (B,)
-                e = torch.exp(1j * pht[:, k])               # (B,) complex
-                Qp = Q[:, p, :].clone()
-                Qq = Q[:, q, :].clone()
-                Np = c[:, None] * Qp - s[:, None] * torch.conj(e)[:, None] * Qq
-                Nq = s[:, None] * e[:, None] * Qp + c[:, None] * Qq
-                rows = [Q[:, i, :] for i in range(N)]
-                rows[p], rows[q] = Np, Nq
-                Q = torch.stack(rows, dim=1)
-            Qseq.append(Q.clone())
-            qr = torch.view_as_real(Q).reshape(B, -1)       # (B,512)
-            f = self.W_P(qr.to(dt))                          # (B,D)
-            Fs.append(f)
-            k = self.W_k(f)                                  # (B,dk)
-            v = self.W_v(f)                                  # (B,dv)
-            qq = self.W_q(f)
-            g = torch.sigmoid(self.W_g(f))
-            Ks.append(k); Vs.append(v); Qs.append(qq); Gs.append(g)
-            M = lam[:, t, None, None] * M + k.unsqueeze(-1) * (g * v).unsqueeze(1)
-            reads.append(torch.einsum('bd,bde->be', qq, M))
-        Qs_t = torch.stack(Qseq, dim=1)   # (B,T,N,N) complex
-        Ff = torch.stack(Fs, dim=1)       # (B,T,D)
-        Kk = torch.stack(Ks, dim=1)
-        Vv = torch.stack(Vs, dim=1)
-        Qq = torch.stack(Qs, dim=1)
-        Rd = torch.stack(reads, dim=1)    # (B,T,dv)
-        # --- shared Hermitian attention, single head, no QKV ---
-        As = hermitian_build(self.As_r, self.As_i)  # (N,N) complex
-        Aa = hermitian_build(self.Aa_r, self.Aa_i)
-        QAs = Qs_t @ As   # (B,T,N,N)
-        QAa = Qs_t @ Aa
-        Ff_flat = Qs_t.reshape(B, T, -1)                 # (B,T,256) complex
-        Gs_flat = QAs.reshape(B, T, -1)
-        Ga_flat = QAa.reshape(B, T, -1)
-        S_sym = torch.einsum('bid,bjd->bij', Gs_flat, torch.conj(Ff_flat)).real / N
-        S_anti = torch.einsum('bid,bjd->bij', Ga_flat, torch.conj(Ff_flat)).imag / N
-        S = S_sym + S_anti
-        S = S.masked_fill(torch.triu(torch.ones(T, T, device=dev, dtype=torch.bool), 1).unsqueeze(0), float('-inf'))
-        A = torch.softmax(S.float(), dim=-1).to(dt)
-        o_attn = torch.einsum('bij,bjd->bid', A, Ff)     # values = features, no V proj
-        o = o_attn + self.W_r(Rd)
-        x = x + o
+        th = torch.tanh(self.W_theta(h)) * 0.5            # (B,T,16)
+        lam = torch.sigmoid(self.w_l(h)).squeeze(-1) * 0.099 + 0.9
+        # --- unitary core ALWAYS fp32 (no ComplexHalf, no half-rotations) ---
+        cm = torch.amp.autocast('cuda', enabled=False) if x.is_cuda else nullcontext()
+        with cm:
+            th32 = th.float()
+            lam32 = lam.float()
+            U = torch.eye(N, device=x.device).expand(B, T, N, N).contiguous()
+            U = _stage(U, self.P0, self.Q0, th32[..., :8])
+            U = _stage(U, self.P1, self.Q1, th32[..., 8:])
+            Qs = _prefix_products(U)                       # (B,T,N,N)
+            Ff = self.W_P(Qs.reshape(B * T, -1)).view(B, T, D)
+            Kk = self.W_k(Ff)
+            Vv = self.W_v(Ff)
+            Qq = self.W_q(Ff)
+            Gg = torch.sigmoid(self.W_g(Ff))
+            Sm = 0.5 * (self.Sm.float() + self.Sm.float().T)
+            Am = 0.5 * (self.Am.float() - self.Am.float().T)
+            Gs = (Qs @ Sm).reshape(B, T, -1)
+            Ga = (Qs @ Am).reshape(B, T, -1)
+            Fm = Qs.reshape(B, T, -1)
+            S = (torch.einsum('bid,bjd->bij', Gs, Fm)
+                 + torch.einsum('bid,bjd->bij', Ga, Fm)) / N
+            S = S.masked_fill(torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), 1).unsqueeze(0), float('-inf'))
+            A = torch.softmax(S, dim=-1)
+            o_attn = torch.einsum('bij,bjd->bid', A, Ff)
+            # Mt: scalar-gated affine recurrence (only light loop left, real fp32)
+            M = torch.zeros(B, self.dk, self.dv, device=x.device)
+            reads = []
+            for t in range(T):
+                M = lam32[:, t, None, None] * M + Kk[:, t].unsqueeze(-1) * (Gg[:, t] * Vv[:, t]).unsqueeze(1)
+                reads.append(torch.einsum('bd,bde->be', Qq[:, t], M))
+            Rd = torch.stack(reads, dim=1)
+            o = o_attn + self.W_r(Rd)
+        x = x + o.to(x.dtype)
         h2 = self.n2(x)
         x = x + self.down(F.silu(self.gate(h2)) * self.up(h2))
         return x
