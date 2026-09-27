@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pt
+*.ckpt
+/kaggle_working/
+/working/
+.venv/

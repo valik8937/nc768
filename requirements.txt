@@ -1,0 +1,5 @@
+torch>=2.2
+transformers>=4.40
+datasets>=2.19
+tokenizers>=0.19
+tqdm
