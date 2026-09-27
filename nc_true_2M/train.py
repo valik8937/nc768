@@ -19,6 +19,9 @@ def args_():
     p.add_argument('--save', type=int, default=2000)
     p.add_argument('--sample_every', type=int, default=500)
     p.add_argument('--sample_len', type=int, default=120)
+    p.add_argument('--sample_temp', type=float, default=0.8)
+    p.add_argument('--sample_topk', type=int, default=40)
+    p.add_argument('--dropout', type=float, default=0.0)
     p.add_argument('--d', type=int, default=256)
     p.add_argument('--layers', type=int, default=4)
     p.add_argument('--vocab', type=int, default=256)
@@ -29,7 +32,7 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     dev = 'cuda' if torch.cuda.is_available() else 'cpu'
     print('device:', dev)
-    m = NCTrueLM(vocab=a.vocab, d=a.d, layers=a.layers).to(dev)
+    m = NCTrueLM(vocab=a.vocab, d=a.d, layers=a.layers, dropout=a.dropout).to(dev)
     print(m.count())
     opt = torch.optim.AdamW(m.parameters(), lr=a.lr, betas=(0.9, 0.95), weight_decay=0.05)
     sc = torch.amp.GradScaler('cuda', enabled=(dev == 'cuda'))
@@ -74,10 +77,13 @@ def main():
                 with torch.no_grad():
                     prompt = torch.tensor([list(b"The science of ")], device=dev)
                     for _ in range(a.sample_len):
-                        lg = m(prompt[:, -256:])
-                        prompt = torch.cat([prompt, lg[:, -1:].argmax(-1)], dim=1)
+                        lg = m(prompt[:, -256:])[:, -1] / max(a.sample_temp, 1e-3)
+                        if a.sample_topk > 0:
+                            v, _ = torch.topk(lg, min(a.sample_topk, lg.size(-1)))
+                            lg = lg.masked_fill(lg < v[:, -1:], float('-inf'))
+                        prompt = torch.cat([prompt, torch.multinomial(torch.softmax(lg, -1), 1)], dim=1)
                     txt = bytes(prompt[0].tolist()).decode('utf-8', errors='ignore')
-                    print(f"--- [SAMPLE @ step {step}] ---\n{txt[:300]}\n---------------------------", flush=True)
+                    print(f"--- [SAMPLE @ step {step} | T={a.sample_temp} k={a.sample_topk}] ---\n{txt[:300]}\n---------------------------", flush=True)
                 m.train()
         if step % a.save == 0:
             torch.save({'step': step, 'model': m.state_dict()}, f"{a.out}/ckpt_{step}.pt")

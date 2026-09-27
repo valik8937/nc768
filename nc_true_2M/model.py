@@ -63,7 +63,7 @@ def _prefix_products(U):
 
 class NCBlock(nn.Module):
     """Honest block. Biggest mats: W_P (256->d) + SwiGLU (ff=2d). No QKV anywhere."""
-    def __init__(self, d=256, dk=32, dv=64, ff=None):
+    def __init__(self, d=256, dk=32, dv=64, ff=None, dropout=0.0):
         super().__init__()
         self.d, self.dk, self.dv = d, dk, dv
         ff = 2 * d if ff is None else ff
@@ -82,6 +82,7 @@ class NCBlock(nn.Module):
         self.gate = nn.Linear(d, ff, bias=False)
         self.up = nn.Linear(d, ff, bias=False)
         self.down = nn.Linear(ff, d, bias=False)
+        self.drop = nn.Dropout(dropout)
         self.register_buffer('P0', torch.tensor([p for p, _ in PAIRS0]), persistent=False)
         self.register_buffer('Q0', torch.tensor([q for _, q in PAIRS0]), persistent=False)
         self.register_buffer('P1', torch.tensor([p for p, _ in PAIRS1]), persistent=False)
@@ -114,7 +115,7 @@ class NCBlock(nn.Module):
             S = (torch.einsum('bid,bjd->bij', Gs, Fm)
                  + torch.einsum('bid,bjd->bij', Ga, Fm)) / N
             S = S.masked_fill(torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), 1).unsqueeze(0), float('-inf'))
-            A = torch.softmax(S, dim=-1)
+            A = self.drop(torch.softmax(S, dim=-1))
             o_attn = torch.einsum('bij,bjd->bid', A, Ff)
             # Mt in parallel dual form (0 loops): M_t = lam_t M_{t-1} + k_t (g_t v_t)^T
             # unrolled: r_t = sum_{j<=t} (q_t.k_j) * prod_{k=j+1..t}(lam_k) * (g_j v_j)
@@ -125,17 +126,17 @@ class NCBlock(nn.Module):
             scores = torch.matmul(Qq, Kk.transpose(-2, -1)) * decay  # (B,T,T)
             Rd = torch.matmul(scores, Gg * Vv)                    # (B,T,dv)
             o = o_attn + self.W_r(Rd)
-        x = x + o.to(x.dtype)
+        x = x + self.drop(o.to(x.dtype))
         h2 = self.n2(x)
-        x = x + self.down(F.silu(self.gate(h2)) * self.up(h2))
+        x = x + self.drop(self.down(F.silu(self.gate(h2)) * self.up(h2)))
         return x
 
 
 class NCTrueLM(nn.Module):
-    def __init__(self, vocab=256, d=256, layers=4, dk=32, dv=64, ff=None):
+    def __init__(self, vocab=256, d=256, layers=4, dk=32, dv=64, ff=None, dropout=0.0):
         super().__init__()
         self.tok = nn.Embedding(vocab, d)
-        self.blocks = nn.ModuleList([NCBlock(d, dk, dv, ff) for _ in range(layers)])
+        self.blocks = nn.ModuleList([NCBlock(d, dk, dv, ff, dropout) for _ in range(layers)])
         self.nf = RMSNorm(d)
         self.apply(self._init)
 
