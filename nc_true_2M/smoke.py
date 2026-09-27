@@ -1,5 +1,5 @@
 """Smoke: params<=3M, no QKV, commutator!=0, causal, short train run. Usage: python smoke.py [--seq 256]"""
-import argparse, os, re
+import argparse, os, re, time
 import torch, torch.nn.functional as F
 from model import NCTrueLM, N, _stage
 
@@ -53,13 +53,33 @@ with torch.no_grad():
     assert (m(full)[0, 5] - m(full[:, :6])[0, 5]).abs().max().item() < 1e-4
 print('causal OK')
 
-# 4. train few steps at --seq
+# 4. train few steps at --seq + tok/s
 opt = torch.optim.AdamW(m.parameters(), lr=3e-4)
 m.train()
+t0 = time.time()
 for s in range(3):
     x = torch.randint(0, 256, (2, a.seq))
     loss = F.cross_entropy(m(x).view(-1, 256), torch.roll(x, -1, 1).reshape(-1))
     opt.zero_grad(); loss.backward()
     torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0); opt.step()
     print(f'step {s} loss {loss.item():.3f}')
+print(f'tok/s (CPU): {3 * 2 * a.seq / (time.time() - t0):.0f}')
+
+# 5. loop == parallel dual form (exact same math)
+B, T, dk, dv = 2, 17, 8, 12
+lam = 0.9 + 0.099 * torch.rand(B, T)
+K = torch.randn(B, T, dk); V = torch.randn(B, T, dv)
+Q = torch.randn(B, T, dk); G = torch.rand(B, T, dv)
+M = torch.zeros(B, dk, dv); ref = []
+for t in range(T):
+    M = lam[:, t, None, None] * M + K[:, t].unsqueeze(-1) * (G[:, t] * V[:, t]).unsqueeze(1)
+    ref.append(torch.einsum('bd,bde->be', Q[:, t], M))
+ref = torch.stack(ref, 1)
+cum = torch.cumsum(torch.log(lam.clamp(min=1e-5)), 1)
+dec = torch.exp(cum.unsqueeze(2) - cum.unsqueeze(1))
+dec = dec.masked_fill(~torch.tril(torch.ones(T, T, dtype=torch.bool)).unsqueeze(0), 0.0)
+par = torch.matmul(torch.matmul(Q, K.transpose(-2, -1)) * dec, G * V)
+dd = (ref - par).abs().max().item()
+print('dual-form diff:', dd)
+assert dd < 1e-4, "dual form mismatch!"
 print('SMOKE OK')

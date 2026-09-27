@@ -115,13 +115,14 @@ class NCBlock(nn.Module):
             S = S.masked_fill(torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), 1).unsqueeze(0), float('-inf'))
             A = torch.softmax(S, dim=-1)
             o_attn = torch.einsum('bij,bjd->bid', A, Ff)
-            # Mt: scalar-gated affine recurrence (only light loop left, real fp32)
-            M = torch.zeros(B, self.dk, self.dv, device=x.device)
-            reads = []
-            for t in range(T):
-                M = lam32[:, t, None, None] * M + Kk[:, t].unsqueeze(-1) * (Gg[:, t] * Vv[:, t]).unsqueeze(1)
-                reads.append(torch.einsum('bd,bde->be', Qq[:, t], M))
-            Rd = torch.stack(reads, dim=1)
+            # Mt in parallel dual form (0 loops): M_t = lam_t M_{t-1} + k_t (g_t v_t)^T
+            # unrolled: r_t = sum_{j<=t} (q_t.k_j) * prod_{k=j+1..t}(lam_k) * (g_j v_j)
+            log_lam = torch.log(lam32.clamp(min=1e-5))            # (B,T)
+            cum = torch.cumsum(log_lam, dim=1)                    # (B,T)
+            decay = torch.exp(cum.unsqueeze(2) - cum.unsqueeze(1))  # (B,T,T)
+            decay = decay.masked_fill(~torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool)).unsqueeze(0), 0.0)
+            scores = torch.matmul(Qq, Kk.transpose(-2, -1)) * decay  # (B,T,T)
+            Rd = torch.matmul(scores, Gg * Vv)                    # (B,T,dv)
             o = o_attn + self.W_r(Rd)
         x = x + o.to(x.dtype)
         h2 = self.n2(x)
