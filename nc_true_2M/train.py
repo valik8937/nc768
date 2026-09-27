@@ -17,6 +17,11 @@ def args_():
     p.add_argument('--out', type=str, default='/kaggle/working/nc_true')
     p.add_argument('--log', type=int, default=50)
     p.add_argument('--save', type=int, default=2000)
+    p.add_argument('--sample_every', type=int, default=500)
+    p.add_argument('--sample_len', type=int, default=120)
+    p.add_argument('--d', type=int, default=256)
+    p.add_argument('--layers', type=int, default=4)
+    p.add_argument('--vocab', type=int, default=256)
     return p.parse_args()
 
 def main():
@@ -24,7 +29,7 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     dev = 'cuda' if torch.cuda.is_available() else 'cpu'
     print('device:', dev)
-    m = NCTrueLM().to(dev)
+    m = NCTrueLM(vocab=a.vocab, d=a.d, layers=a.layers).to(dev)
     print(m.count())
     opt = torch.optim.AdamW(m.parameters(), lr=a.lr, betas=(0.9, 0.95), weight_decay=0.05)
     sc = torch.amp.GradScaler('cuda', enabled=(dev == 'cuda'))
@@ -44,11 +49,12 @@ def main():
         stream = stream[a.batch * (a.seq + 1):]
         return blk[:, :-1].to(dev), blk[:, 1:].to(dev)
     m.train(); run, t0, step = 0.0, time.time(), 0
+    wall0 = time.time()
     while step < a.steps:
         for _ in range(a.accum):
             xb, yb = batch()
             with torch.amp.autocast('cuda', enabled=(dev == 'cuda'), dtype=torch.float16):
-                loss = F.cross_entropy(m(xb).view(-1, 256), yb.reshape(-1)) / a.accum
+                loss = F.cross_entropy(m(xb).view(-1, a.vocab), yb.reshape(-1)) / a.accum
             sc.scale(loss).backward(); run += loss.item() * a.accum
         lr = a.lr * min(1.0, (step + 1) / a.warmup) * (0.5 + 0.5 * math.cos(math.pi * step / a.steps))
         for pg in opt.param_groups: pg['lr'] = lr
@@ -57,8 +63,22 @@ def main():
         if step % a.log == 0:
             dt = time.time() - t0
             avg = run / (a.log * a.accum)
-            print(f"step {step} loss {avg:.3f} bpb {avg/math.log(2):.3f} tok/s {a.log*a.accum*a.batch*a.seq/dt:.0f}", flush=True)
+            tps = a.log * a.accum * a.batch * a.seq / max(dt, 1e-6)
+            vram = torch.cuda.memory_allocated() / 1e9 if dev == 'cuda' else 0.0
+            eta = (time.time() - wall0) / max(step, 1) * (a.steps - step)
+            eh, er = divmod(int(eta), 3600); em, es = divmod(er, 60)
+            print(f"[ {step}/{a.steps} | {100 * step / a.steps:.1f}%] loss: {avg:.3f} (bpb: {avg / math.log(2):.2f}) | lr: {lr:.1e} | {tps / 1000:.1f}k tok/s | VRAM: {vram:.1f}G | ETA: {eh:02d}:{em:02d}:{es:02d}", flush=True)
             run, t0 = 0.0, time.time()
+            if step % a.sample_every == 0:
+                m.eval()
+                with torch.no_grad():
+                    prompt = torch.tensor([list(b"The science of ")], device=dev)
+                    for _ in range(a.sample_len):
+                        lg = m(prompt[:, -256:])
+                        prompt = torch.cat([prompt, lg[:, -1:].argmax(-1)], dim=1)
+                    txt = bytes(prompt[0].tolist()).decode('utf-8', errors='ignore')
+                    print(f"--- [SAMPLE @ step {step}] ---\n{txt[:300]}\n---------------------------", flush=True)
+                m.train()
         if step % a.save == 0:
             torch.save({'step': step, 'model': m.state_dict()}, f"{a.out}/ckpt_{step}.pt")
     torch.save({'step': step, 'model': m.state_dict()}, f"{a.out}/final.pt")

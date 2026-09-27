@@ -62,10 +62,11 @@ def _prefix_products(U):
 
 
 class NCBlock(nn.Module):
-    """Honest block. Biggest mats: W_P 512->256 + SwiGLU. No QKV anywhere."""
-    def __init__(self, d=256, dk=32, dv=64):
+    """Honest block. Biggest mats: W_P (256->d) + SwiGLU (ff=2d). No QKV anywhere."""
+    def __init__(self, d=256, dk=32, dv=64, ff=None):
         super().__init__()
         self.d, self.dk, self.dv = d, dk, dv
+        ff = 2 * d if ff is None else ff
         self.n1 = RMSNorm(d)
         self.W_theta = nn.Linear(d, 16, bias=False)  # 16 plane angles, no phi
         self.Sm = nn.Parameter(torch.randn(N, N) * 0.05)  # symmetrized at use
@@ -78,9 +79,9 @@ class NCBlock(nn.Module):
         self.w_l = nn.Linear(d, 1, bias=True)
         self.W_r = nn.Linear(dv, d, bias=False)
         self.n2 = RMSNorm(d)
-        self.gate = nn.Linear(d, 512, bias=False)
-        self.up = nn.Linear(d, 512, bias=False)
-        self.down = nn.Linear(512, d, bias=False)
+        self.gate = nn.Linear(d, ff, bias=False)
+        self.up = nn.Linear(d, ff, bias=False)
+        self.down = nn.Linear(ff, d, bias=False)
         self.register_buffer('P0', torch.tensor([p for p, _ in PAIRS0]), persistent=False)
         self.register_buffer('Q0', torch.tensor([q for _, q in PAIRS0]), persistent=False)
         self.register_buffer('P1', torch.tensor([p for p, _ in PAIRS1]), persistent=False)
@@ -131,10 +132,10 @@ class NCBlock(nn.Module):
 
 
 class NCTrueLM(nn.Module):
-    def __init__(self, vocab=256, d=256, layers=4):
+    def __init__(self, vocab=256, d=256, layers=4, dk=32, dv=64, ff=None):
         super().__init__()
         self.tok = nn.Embedding(vocab, d)
-        self.blocks = nn.ModuleList([NCBlock(d) for _ in range(layers)])
+        self.blocks = nn.ModuleList([NCBlock(d, dk, dv, ff) for _ in range(layers)])
         self.nf = RMSNorm(d)
         self.apply(self._init)
 
@@ -154,3 +155,8 @@ class NCTrueLM(nn.Module):
     def count(self):
         t = sum(p.numel() for p in self.parameters())
         return {'total': t, 'emb': self.tok.weight.numel(), 'backbone': t - self.tok.weight.numel()}
+
+
+def build_nc768(vocab=256):
+    """Normal-depth honest config: d=768, 12 layers, byte vocab."""
+    return NCTrueLM(vocab=vocab, d=768, layers=12)

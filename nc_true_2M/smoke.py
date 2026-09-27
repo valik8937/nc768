@@ -5,14 +5,18 @@ from model import NCTrueLM, N, _stage
 
 p = argparse.ArgumentParser()
 p.add_argument('--seq', type=int, default=256)
+p.add_argument('--d', type=int, default=256)
+p.add_argument('--layers', type=int, default=4)
+p.add_argument('--vocab', type=int, default=256)
+p.add_argument('--budget', type=int, default=3_000_000)
 a = p.parse_args()
 
 HERE = os.path.dirname(os.path.abspath(__file__))  # never grep the repo-root clone again
 torch.manual_seed(0)
-m = NCTrueLM(vocab=256, d=256, layers=4)
+m = NCTrueLM(vocab=a.vocab, d=a.d, layers=a.layers)
 c = m.count()
 print(c)
-assert c['total'] <= 3_000_000, f"TOO BIG: {c['total']}"
+assert c['total'] <= a.budget, f"TOO BIG: {c['total']}"
 
 # 1. no QKV in OUR file (not the old clone at repo root)
 src = open(os.path.join(HERE, 'model.py')).read()
@@ -49,7 +53,7 @@ print('non-commutative OK')
 
 # 3. causal
 with torch.no_grad():
-    full = torch.randint(0, 256, (1, 16))
+    full = torch.randint(0, a.vocab, (1, 16))
     assert (m(full)[0, 5] - m(full[:, :6])[0, 5]).abs().max().item() < 1e-4
 print('causal OK')
 
@@ -58,8 +62,8 @@ opt = torch.optim.AdamW(m.parameters(), lr=3e-4)
 m.train()
 t0 = time.time()
 for s in range(3):
-    x = torch.randint(0, 256, (2, a.seq))
-    loss = F.cross_entropy(m(x).view(-1, 256), torch.roll(x, -1, 1).reshape(-1))
+    x = torch.randint(0, a.vocab, (2, a.seq))
+    loss = F.cross_entropy(m(x).view(-1, a.vocab), torch.roll(x, -1, 1).reshape(-1))
     opt.zero_grad(); loss.backward()
     torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0); opt.step()
     print(f'step {s} loss {loss.item():.3f}')
